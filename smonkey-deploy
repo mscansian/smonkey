@@ -1,0 +1,171 @@
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
+
+from __future__ import print_function
+import sys
+import subprocess
+import argparse
+import os
+import shutil
+import csv
+
+
+__VERSION__ = "1.0"
+
+SMONKEY_DEPLOY_CONFIG_DIR = os.path.expanduser("~/.local/share/smonkey/deploy")
+SMONKEY_DEPLOY_CSV_SEPARATOR = ","
+
+
+class Deploy:
+	def add(self, args):
+		if args.project == "":
+			self._error("Missing project name.")
+			sys.exit(1)
+
+		# Check if project already exists in config file
+		projects_name = [project[0] for project in self._read_projects()]
+		if args.project in projects_name:
+			self._error("Project", repr(args.project), "already exists.")
+			sys.exit(1)
+
+		# Check if git folder already exists
+		git_dir = os.path.join(SMONKEY_DEPLOY_CONFIG_DIR, args.project)
+		if os.path.exists(git_dir):
+			self._error("Project", repr(args.project), "already exists.", "[GIT FOLDER EXISTS]")
+			sys.exit(1)
+
+		# Clone git repository
+		try:
+			self._deploy(project=args.project, repository=args.repository, project_dir=args.target, branch=args.branch)
+		except subprocess.CalledProcessError:
+			self._error("Project not added.")
+			sys.exit(1)
+
+		# Write to config file
+		projects = self._read_projects()
+		projects.append([args.project, args.repository, args.target, args.branch, args.email])
+		self._write_projects(projects)
+
+		self._out("Project", repr(args.project), "was added.")
+
+	def rm(self, args):
+		projects_name = [project[0] for project in self._read_projects()]
+		if args.project not in projects_name:
+			self._error("Project", repr(args.project), "not found.")
+			sys.exit(1)
+
+		shutil.rmtree(os.path.join(SMONKEY_DEPLOY_CONFIG_DIR, args.project))  # Remove git dir
+		projects = [project for project in self._read_projects() if project[0] != args.project]
+		self._write_projects(projects)
+		self._out("Project", repr(args.project), "was removed.")
+
+	def list(self, args):
+		projects = self._read_projects()
+		for project in projects:
+			self._out(project[0])  # Print project name
+
+	def run(self, args):
+		projects = self._read_projects()
+		for project in projects:
+			if project[0] == args.project or args.project is None:
+				try:
+					self._deploy(project=project[0], repository=project[1], project_dir=project[2], branch=project[3])
+				except DeployError:
+					self._error("Error!", repr(project[0]), "was not deployed.")
+					pass  # Skip to next project
+				finally:
+					print ("")
+
+	def _deploy(self, project, repository, project_dir, branch):
+		# Should we clone or pull?
+		git_dir = os.path.join(SMONKEY_DEPLOY_CONFIG_DIR, project)
+		if os.path.exists(git_dir) and os.path.exists(project_dir):
+			deploy_method = "PULL"
+		else:
+			deploy_method = "CLONE"
+
+		if deploy_method == "CLONE":
+			self._out("Cloning git repository", repository)
+			try:
+				subprocess.check_call(["git", "clone", "-b", branch, "--single-branch", "--separate-git-dir=" + git_dir, repository, project_dir])
+			except subprocess.CalledProcessError:
+				raise DeployError()
+		elif deploy_method == "PULL":
+			self._out("Deploying", repr(project), "from origin branch", repr(branch))
+			try:
+				subprocess.check_call(["git", "-C", project_dir, "fetch", "origin", branch])
+				subprocess.check_call(["git", "-C", project_dir, "checkout", branch, "-f"])
+				subprocess.check_call(["git", "-C", project_dir, "clean", "-fd"])
+				subprocess.check_call(["git", "-C", project_dir, "reset", "--hard", "origin/" + branch])
+			except subprocess.CalledProcessError:
+				raise DeployError()
+		self._out("Project", repr(project), "was successfully deployed!")
+
+	def _read_projects(self):
+		if not os.path.exists(SMONKEY_DEPLOY_CONFIG_DIR):
+			os.makedirs(SMONKEY_DEPLOY_CONFIG_DIR)
+
+		config_filename = os.path.join(SMONKEY_DEPLOY_CONFIG_DIR, "projects.conf")
+		if not os.path.exists(config_filename):
+			return []
+
+		with open(config_filename, "r") as config:
+			parser = csv.reader(config, delimiter=SMONKEY_DEPLOY_CSV_SEPARATOR)
+			projects = list(parser)
+		return projects
+
+	def _write_projects(self, projects):
+		if not os.path.exists(SMONKEY_DEPLOY_CONFIG_DIR):
+			os.makedirs(SMONKEY_DEPLOY_CONFIG_DIR)
+
+		config_filename = os.path.join(SMONKEY_DEPLOY_CONFIG_DIR, "projects.conf")
+		with open(config_filename, "w") as config:
+			for project in projects:
+				for parameter in project:
+					config.write(parameter)
+					config.write(SMONKEY_DEPLOY_CSV_SEPARATOR)
+				config.write(os.linesep)
+
+	def _out(self, *msg):
+		print (*msg)
+
+	def _error(self, *msg):
+		print (*msg, file=sys.stderr)
+
+
+class DeployError(Exception):
+	pass
+
+
+if __name__ == "__main__":
+	if os.name != "posix":
+		print ("This application is not supported on", repr(os.name), "system", file=sys.stderr)
+		sys.exit(1)
+
+	parser = argparse.ArgumentParser(prog='smonkey-deploy', description='Deploy an application from a git repository.')
+	subparser = parser.add_subparsers(help='command')
+
+	parser_deploy = subparser.add_parser('add', help='Add new project to deploy list')
+	parser_deploy.add_argument("project")
+	parser_deploy.add_argument("repository")
+	parser_deploy.add_argument("target")
+	parser_deploy.add_argument("--branch", default="master")
+	parser_deploy.add_argument("--email", default="")
+	parser_deploy.set_defaults(func=Deploy().add)
+
+	parser_rm = subparser.add_parser('rm', help='Remove a project from deploy list')
+	parser_rm.add_argument("project")
+	parser_rm.set_defaults(func=Deploy().rm)
+
+	parser_list = subparser.add_parser('list', help='Show deploy list')
+	parser_list.set_defaults(func=Deploy().list)
+
+	parser_run = subparser.add_parser('run', help='Deploy a project')
+	parser_run.add_argument("--project", default=None)
+	parser_run.set_defaults(func=Deploy().run)
+
+	parser_version = subparser.add_parser('version', help='Show smonkey-deploy version')
+	parser_version.set_defaults(func=lambda x: print ("smonkey-deploy:", __VERSION__))
+
+	args = parser.parse_args()
+	args.func(args)
